@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::future::{BoxFuture, FutureExt};
+use futures::future::FutureExt;
 use futures::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
@@ -46,6 +46,7 @@ use crate::bloom_filter::{
 };
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use crate::util::async_util::{MaybeLocalBoxFuture, MaybeLocalFutureExt, MaybeSend};
 
 mod metadata;
 pub use metadata::*;
@@ -71,12 +72,15 @@ pub use store::*;
 /// [`ObjectStore`]: object_store::ObjectStore
 ///
 /// [`tokio::fs::File`]: https://docs.rs/tokio/latest/tokio/fs/struct.File.html
-pub trait AsyncFileReader: Send {
+pub trait AsyncFileReader: MaybeSend {
     /// Retrieve the bytes in `range`
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
+    fn get_bytes(&mut self, range: Range<u64>) -> MaybeLocalBoxFuture<'_, Result<Bytes>>;
 
     /// Retrieve multiple byte ranges. The default implementation will call `get_bytes` sequentially
-    fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> MaybeLocalBoxFuture<'_, Result<Vec<Bytes>>> {
         async move {
             let mut result = Vec::with_capacity(ranges.len());
 
@@ -87,7 +91,7 @@ pub trait AsyncFileReader: Send {
 
             Ok(result)
         }
-        .boxed()
+        .boxed_maybe_local()
     }
 
     /// Return a future which results in the [`ParquetMetaData`] for this Parquet file.
@@ -109,41 +113,44 @@ pub trait AsyncFileReader: Send {
     fn get_metadata<'a>(
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>>;
+    ) -> MaybeLocalBoxFuture<'a, Result<Arc<ParquetMetaData>>>;
 }
 
 /// This allows Box<dyn AsyncFileReader + '_> to be used as an AsyncFileReader,
 impl AsyncFileReader for Box<dyn AsyncFileReader + '_> {
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+    fn get_bytes(&mut self, range: Range<u64>) -> MaybeLocalBoxFuture<'_, Result<Bytes>> {
         self.as_mut().get_bytes(range)
     }
 
-    fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> MaybeLocalBoxFuture<'_, Result<Vec<Bytes>>> {
         self.as_mut().get_byte_ranges(ranges)
     }
 
     fn get_metadata<'a>(
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
+    ) -> MaybeLocalBoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         self.as_mut().get_metadata(options)
     }
 }
 
 impl<T: AsyncFileReader + MetadataFetch + AsyncRead + AsyncSeek + Unpin> MetadataSuffixFetch for T {
-    fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
+    fn fetch_suffix(&mut self, suffix: usize) -> MaybeLocalBoxFuture<'_, Result<Bytes>> {
         async move {
             self.seek(SeekFrom::End(-(suffix as i64))).await?;
             let mut buf = Vec::with_capacity(suffix);
             self.take(suffix as _).read_to_end(&mut buf).await?;
             Ok(buf.into())
         }
-        .boxed()
+        .boxed_maybe_local()
     }
 }
 
-impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+impl<T: AsyncRead + AsyncSeek + Unpin + MaybeSend> AsyncFileReader for T {
+    fn get_bytes(&mut self, range: Range<u64>) -> MaybeLocalBoxFuture<'_, Result<Bytes>> {
         async move {
             self.seek(SeekFrom::Start(range.start)).await?;
 
@@ -156,13 +163,13 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
 
             Ok(buffer.into())
         }
-        .boxed()
+        .boxed_maybe_local()
     }
 
     fn get_metadata<'a>(
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
+    ) -> MaybeLocalBoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         async move {
             let metadata_opts = options.map(|o| o.metadata_options().clone());
             let mut metadata_reader =
@@ -182,7 +189,7 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
             let parquet_metadata = metadata_reader.load_via_suffix_and_finish(self).await?;
             Ok(Arc::new(parquet_metadata))
         }
-        .boxed()
+        .boxed_maybe_local()
     }
 }
 
@@ -220,7 +227,7 @@ pub struct AsyncReader<T>(T);
 /// See [`ArrowReaderBuilder`] for additional member functions
 pub type ParquetRecordBatchStreamBuilder<T> = ArrowReaderBuilder<AsyncReader<T>>;
 
-impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
+impl<T: AsyncFileReader + MaybeSend + 'static> ParquetRecordBatchStreamBuilder<T> {
     /// Create a new [`ParquetRecordBatchStreamBuilder`] for reading from the
     /// specified source.
     ///
@@ -551,14 +558,14 @@ enum RequestState<T> {
         ///
         /// Note the future owns the reader while the request is outstanding
         /// and returns it upon completion
-        future: BoxFuture<'static, Result<(T, Vec<Bytes>)>>,
+        future: MaybeLocalBoxFuture<'static, Result<(T, Vec<Bytes>)>>,
     },
     Done,
 }
 
 impl<T> RequestState<T>
 where
-    T: AsyncFileReader + Unpin + Send + 'static,
+    T: AsyncFileReader + Unpin + MaybeSend + 'static,
 {
     /// Issue a request to fetch `ranges`, returning the Outstanding state
     fn begin_request(mut input: T, ranges: Vec<Range<u64>>) -> Self {
@@ -572,7 +579,7 @@ where
             let data = input.get_byte_ranges(ranges_captured).await?;
             Ok((input, data))
         }
-        .boxed();
+        .boxed_maybe_local();
         RequestState::Outstanding { ranges, future }
     }
 }
@@ -643,7 +650,7 @@ impl<T> ParquetRecordBatchStream<T> {
 
 impl<T> ParquetRecordBatchStream<T>
 where
-    T: AsyncFileReader + Unpin + Send + 'static,
+    T: AsyncFileReader + Unpin + MaybeSend + 'static,
 {
     /// Fetches the next row group from the stream.
     ///
@@ -696,7 +703,7 @@ where
 
 impl<T> Stream for ParquetRecordBatchStream<T>
 where
-    T: AsyncFileReader + Unpin + Send + 'static,
+    T: AsyncFileReader + Unpin + MaybeSend + 'static,
 {
     type Item = Result<RecordBatch>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -716,7 +723,7 @@ where
 
 impl<T> ParquetRecordBatchStream<T>
 where
-    T: AsyncFileReader + Unpin + Send + 'static,
+    T: AsyncFileReader + Unpin + MaybeSend + 'static,
 {
     /// Inner state machine
     ///
@@ -814,7 +821,7 @@ mod tests {
     }
 
     impl AsyncFileReader for TestReader {
-        fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+        fn get_bytes(&mut self, range: Range<u64>) -> MaybeLocalBoxFuture<'_, Result<Bytes>> {
             let range = range.clone();
             self.requests
                 .lock()
@@ -823,13 +830,13 @@ mod tests {
             futures::future::ready(Ok(self
                 .data
                 .slice(range.start as usize..range.end as usize)))
-            .boxed()
+            .boxed_maybe_local()
         }
 
         fn get_metadata<'a>(
             &'a mut self,
             options: Option<&'a ArrowReaderOptions>,
-        ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
+        ) -> MaybeLocalBoxFuture<'a, Result<Arc<ParquetMetaData>>> {
             let mut metadata_reader = ParquetMetaDataReader::new();
             if let Some(opts) = options {
                 metadata_reader = metadata_reader
@@ -839,7 +846,7 @@ mod tests {
             self.metadata = Some(Arc::new(
                 metadata_reader.parse_and_finish(&self.data).unwrap(),
             ));
-            futures::future::ready(Ok(self.metadata.clone().unwrap().clone())).boxed()
+            futures::future::ready(Ok(self.metadata.clone().unwrap().clone())).boxed_maybe_local()
         }
     }
 

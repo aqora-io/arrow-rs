@@ -25,6 +25,9 @@ pub mod push_buffers;
 pub(crate) mod test_common;
 pub mod utf8;
 
+#[cfg(feature = "async")]
+pub(crate) mod async_util;
+
 #[cfg(any(test, feature = "test_common"))]
 pub use self::test_common::page_util::{
     DataPageBuilder, DataPageBuilderImpl, InMemoryPageIterator,

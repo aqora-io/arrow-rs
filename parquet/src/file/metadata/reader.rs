@@ -1027,7 +1027,6 @@ mod async_tests {
     use arrow_schema::{Field, Schema};
     use bytes::Bytes;
     use futures::FutureExt;
-    use futures::future::BoxFuture;
     use std::fs::File;
     use std::future::Future;
     use std::io::{Read, Seek, SeekFrom};
@@ -1039,6 +1038,7 @@ mod async_tests {
     use crate::arrow::ArrowWriter;
     use crate::file::properties::WriterProperties;
     use crate::file::reader::Length;
+    use crate::util::async_util::MaybeLocalBoxFuture;
     use crate::util::test_common::file_util::get_test_file;
 
     struct MetadataFetchFn<F>(F);
@@ -1048,7 +1048,7 @@ mod async_tests {
         F: FnMut(Range<u64>) -> Fut + Send,
         Fut: Future<Output = Result<Bytes>> + Send,
     {
-        fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+        fn fetch(&mut self, range: Range<u64>) -> MaybeLocalBoxFuture<'_, Result<Bytes>> {
             async move { self.0(range).await }.boxed()
         }
     }
@@ -1061,7 +1061,7 @@ mod async_tests {
         Fut: Future<Output = Result<Bytes>> + Send,
         F2: Send,
     {
-        fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+        fn fetch(&mut self, range: Range<u64>) -> MaybeLocalBoxFuture<'_, Result<Bytes>> {
             async move { self.0(range).await }.boxed()
         }
     }
@@ -1072,7 +1072,7 @@ mod async_tests {
         F2: FnMut(usize) -> Fut + Send,
         Fut: Future<Output = Result<Bytes>> + Send,
     {
-        fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, Result<Bytes>> {
+        fn fetch_suffix(&mut self, suffix: usize) -> MaybeLocalBoxFuture<'_, Result<Bytes>> {
             async move { self.1(suffix).await }.boxed()
         }
     }
